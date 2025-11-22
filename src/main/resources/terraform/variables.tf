@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "AWS 리전"
   type        = string
-  default     = "ap-northeast-2"  # 한국-서울
+  default     = "ap-northeast-2" # 한국-서울
 }
 
 variable "session_id" {

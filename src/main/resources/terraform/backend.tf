@@ -27,12 +27,12 @@
 
 terraform {
   backend "s3" {
-    bucket         = "penguin-land-shared-tfstate"       # 모든 workspace가 공유
-    key            = "terraform.tfstate"                 # workspace별 자동 분리
-    region         = "ap-northeast-2"                    # 한국-서울 리전
-    dynamodb_table = "penguin-land-shared-tflock"        # State Lock 테이블
-    encrypt        = true                                # 암호화 활성화
-    
+    bucket         = "penguin-land-shared-tfstate" # 모든 workspace가 공유
+    key            = "terraform.tfstate"           # workspace별 자동 분리
+    region         = "ap-northeast-2"              # 한국-서울 리전
+    dynamodb_table = "penguin-land-shared-tflock"  # State Lock 테이블
+    encrypt        = true                          # 암호화 활성화
+
     # Workspace별 State 파일 경로 자동 분리
     # 예: env:/user-001/terraform.tfstate
     workspace_key_prefix = "env:"

@@ -27,6 +27,10 @@ public class SessionContext {
     private String latestLog;
     private LocalDateTime lastUpdated;
 
+    // Frontend API fields
+    private LocalDateTime createdAt;
+    private java.util.List<String> logs;
+
     @JsonIgnore  // JSON 직렬화 제외
     private CompletableFuture<Void> currentTask;
 
@@ -47,6 +51,9 @@ public class SessionContext {
         this.progressPercentage = 0;
         this.latestLog = "Initialized";
         this.lastUpdated = LocalDateTime.now();
+        this.createdAt = LocalDateTime.now();
+        this.logs = new java.util.ArrayList<>();
+        this.logs.add("Initialized");
     }
 
     public void updateStatus(InfraStatus status, int progress, String log) {
@@ -54,6 +61,15 @@ public class SessionContext {
         this.progressPercentage = progress;
         this.latestLog = log;
         this.lastUpdated = LocalDateTime.now();
+
+        // ⭐ logs 배열에 추가 (최대 100개 유지)
+        if (this.logs == null) {
+            this.logs = new java.util.ArrayList<>();
+        }
+        this.logs.add(log);
+        if (this.logs.size() > 100) {
+            this.logs.remove(0);  // 오래된 로그 제거
+        }
 
         // ⭐ 상태 변경 시마다 파일로 저장
         saveToFile();

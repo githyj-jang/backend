@@ -33,7 +33,66 @@ public class TerraformService {
     }
 
     /**
-     * FR-01: 비동기 인프라 배포 시작
+     * ⭐ 서버 시작 시 세션 복구
+     */
+    @jakarta.annotation.PostConstruct
+    public void recoverSessions() {
+        log.info("🔄 Starting session recovery...");
+
+        try {
+            Path workspaceRoot = Paths.get(workspacePath);
+            if (!Files.exists(workspaceRoot)) {
+                log.info("No workspace directory found. Skipping recovery.");
+                return;
+            }
+
+            int recoveredCount = 0;
+            int failedCount = 0;
+
+            try (var stream = Files.list(workspaceRoot)) {
+                var sessionDirs = stream.filter(Files::isDirectory).toList();
+
+                for (Path sessionDir : sessionDirs) {
+                    try {
+                        Path progressFile = sessionDir.resolve(".progress.json");
+
+                        if (Files.exists(progressFile)) {
+                            String sessionId = sessionDir.getFileName().toString();
+                            log.info("Found session data for: {}", sessionId);
+
+                            SessionContext context = SessionContext.loadFromFile(progressFile);
+                            context.setSessionId(sessionId);
+                            context.setWorkingDirectory(sessionDir.toAbsolutePath().toString());
+
+                            // 진행 중이던 작업은 FAILED로 변경
+                            if (context.getStatus() == InfraStatus.APPLYING ||
+                                context.getStatus() == InfraStatus.PLANNING ||
+                                context.getStatus() == InfraStatus.INIT) {
+                                context.updateStatus(InfraStatus.FAILED,
+                                    context.getProgressPercentage(),
+                                    "Server restarted during provisioning. You can retry or destroy the resources.");
+                            }
+
+                            sessions.put(sessionId, context);
+                            recoveredCount++;
+                            log.info("✅ Recovered session: {} (status: {})", sessionId, context.getStatus());
+                        }
+                    } catch (Exception e) {
+                        failedCount++;
+                        log.error("❌ Failed to recover session from {}", sessionDir, e);
+                    }
+                }
+            }
+
+            log.info("🎉 Session recovery completed: {} recovered, {} failed", recoveredCount, failedCount);
+
+        } catch (Exception e) {
+            log.error("❌ Session recovery failed", e);
+        }
+    }
+
+    /**
+     * FR-01: 비동기 인프라 배포 시작 (타임아웃 및 자동 롤백 포함)
      * PUT 메서드로 호출 - 기존 인프라가 있으면 업데이트, 없으면 생성
      */
     public CompletableFuture<InfraResponse> applyInfrastructure(TerraformRequest request) {
@@ -54,7 +113,7 @@ public class TerraformService {
         context.setRequest(request);
         context.updateStatus(InfraStatus.INIT, 0, "Initializing Terraform...");
 
-        // 비동기 작업 시작
+        // 비동기 작업 시작 (10분 타임아웃 설정)
         CompletableFuture<InfraResponse> task = CompletableFuture.supplyAsync(() -> {
             try {
                 return executeTerrformApply(context);
@@ -63,19 +122,55 @@ public class TerraformService {
                 context.updateStatus(InfraStatus.FAILED, 0, "Error: " + e.getMessage());
                 throw new RuntimeException("Terraform apply failed", e);
             }
-        });
+        }).orTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
+          .exceptionally(ex -> {
+              // 타임아웃 또는 에러 발생 시 자동 롤백
+              if (ex.getCause() instanceof java.util.concurrent.TimeoutException) {
+                  log.error("⏱️ Terraform apply timeout (10 minutes) for session: {}", sessionId);
+                  context.updateStatus(InfraStatus.FAILED, 0, "Timeout: Terraform apply exceeded 10 minutes");
+
+                  // 자동 롤백 실행
+                  executeAutoRollback(context);
+              } else {
+                  log.error("❌ Terraform apply error for session: {}", sessionId, ex);
+
+                  // 부분 생성 실패 시 자동 롤백
+                  executeAutoRollback(context);
+              }
+
+              throw new RuntimeException("Provisioning failed and rolled back", ex);
+          });
 
         context.setCurrentTask(task.thenAccept(r -> {}));
         return task;
     }
 
     /**
-     * FR-04: 리소스 파괴
+     * FR-04: 리소스 파괴 (개선: 세션이 없어도 작동)
      */
     public CompletableFuture<String> destroyInfrastructure(String sessionId) {
         SessionContext context = sessions.get(sessionId);
+
+        // ⭐ 세션이 없으면 복구 시도
         if (context == null) {
-            throw new IllegalStateException("No infrastructure found for session: " + sessionId);
+            log.warn("Session {} not found in memory. Attempting to recover or create temporary session...", sessionId);
+
+            // 1. workspace 디렉토리 확인
+            Path sessionDir = Paths.get(workspacePath, sessionId);
+            if (Files.exists(sessionDir)) {
+                // 디렉토리가 있으면 임시 세션 생성
+                log.info("Found workspace directory for session: {}. Creating temporary session.", sessionId);
+                context = new SessionContext(sessionId, sessionDir.toAbsolutePath().toString());
+                context.updateStatus(InfraStatus.DESTROYING, 0, "Recovered session for destruction");
+                sessions.put(sessionId, context);
+            } else {
+                // 디렉토리도 없으면 새로 생성 (Terraform workspace에서 state를 가져올 수 있음)
+                log.info("No workspace directory found. Creating new workspace for session: {}", sessionId);
+                String newSessionDir = createSessionWorkspace(sessionId);
+                context = new SessionContext(sessionId, newSessionDir);
+                context.updateStatus(InfraStatus.DESTROYING, 0, "Created workspace to destroy remote resources");
+                sessions.put(sessionId, context);
+            }
         }
 
         // 이미 실행 중인 작업이 있는지 확인
@@ -85,12 +180,14 @@ public class TerraformService {
 
         context.updateStatus(InfraStatus.DESTROYING, 0, "Starting terraform destroy...");
 
+        final SessionContext finalContext = context;
+
         CompletableFuture<String> task = CompletableFuture.supplyAsync(() -> {
             try {
-                return executeTerraformDestroy(context);
+                return executeTerraformDestroy(finalContext);
             } catch (Exception e) {
                 log.error("Terraform destroy failed for session {}", sessionId, e);
-                context.updateStatus(InfraStatus.FAILED, 0, "Destroy failed: " + e.getMessage());
+                finalContext.updateStatus(InfraStatus.FAILED, 0, "Destroy failed: " + e.getMessage());
                 throw new RuntimeException("Terraform destroy failed", e);
             }
         });
@@ -134,6 +231,29 @@ public class TerraformService {
                 outputs,
                 "Infrastructure information retrieved"
         );
+    }
+
+    /**
+     * ⭐ Terraform graph 생성 (DOT 형식)
+     * terraform graph 명령어 출력을 그대로 반환
+     */
+    public String getTerraformGraph(String sessionId) throws Exception {
+        SessionContext context = sessions.get(sessionId);
+        if (context == null) {
+            throw new IllegalStateException("No infrastructure found for session: " + sessionId);
+        }
+
+        String workDir = context.getWorkingDirectory();
+
+        try {
+            // terraform graph 실행 (로그 출력 없이)
+            String graph = runCommandSilent(workDir, "terraform", "graph");
+            log.debug("Generated terraform graph for session: {}", sessionId);
+            return graph;
+        } catch (Exception e) {
+            log.error("Failed to generate terraform graph for session: {}", sessionId, e);
+            throw new RuntimeException("Failed to generate terraform graph", e);
+        }
     }
 
     /**
@@ -182,13 +302,35 @@ public class TerraformService {
             throw new RuntimeException("Workspace setup failed: " + e.getMessage(), e);
         }
 
-        // 5. Terraform plan
+        // 5. Terraform plan (State Lock 에러 시 자동 재시도)
         context.updateStatus(InfraStatus.PLANNING, 40, "Running terraform plan...");
-        runCommand(workDir, "terraform", "plan", "-out=tfplan", "-input=false");
+        try {
+            runCommand(workDir, "terraform", "plan", "-out=tfplan", "-input=false");
+        } catch (RuntimeException e) {
+            if (e.getMessage() != null && e.getMessage().contains("Error acquiring the state lock")) {
+                log.warn("🔒 State lock detected during plan. Attempting to force unlock...");
+                handleStateLockError(context, workDir, e);
+                // 재시도
+                runCommand(workDir, "terraform", "plan", "-out=tfplan", "-input=false");
+            } else {
+                throw e;
+            }
+        }
 
-        // 6. Terraform apply
+        // 6. Terraform apply (State Lock 에러 시 자동 재시도)
         context.updateStatus(InfraStatus.APPLYING, 60, "Running terraform apply...");
-        runCommand(workDir, "terraform", "apply", "-input=false", "-auto-approve", "tfplan");
+        try {
+            runCommand(workDir, "terraform", "apply", "-input=false", "-auto-approve", "tfplan");
+        } catch (RuntimeException e) {
+            if (e.getMessage() != null && e.getMessage().contains("Error acquiring the state lock")) {
+                log.warn("🔒 State lock detected during apply. Attempting to force unlock...");
+                handleStateLockError(context, workDir, e);
+                // 재시도
+                runCommand(workDir, "terraform", "apply", "-input=false", "-auto-approve", "tfplan");
+            } else {
+                throw e;
+            }
+        }
 
         // 7. Outputs 파싱
         context.updateStatus(InfraStatus.COMPLETE, 100, "Infrastructure provisioning completed!");
@@ -237,6 +379,68 @@ public class TerraformService {
     }
 
     /**
+     * ⭐ FR-01: 자동 롤백 실행 (부분 생성 실패 시)
+     * 비동기로 실행하여 메인 스레드를 블록하지 않음
+     */
+    private void executeAutoRollback(SessionContext context) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                log.warn("🔄 Auto-rollback initiated for session: {}", context.getSessionId());
+                context.updateStatus(InfraStatus.DESTROYING, 0, "Auto-rollback: Cleaning up partial resources...");
+
+                String workDir = context.getWorkingDirectory();
+                String sessionId = context.getSessionId();
+
+                // 1. Workspace 선택 시도
+                try {
+                    runCommand(workDir, "terraform", "workspace", "select", sessionId);
+                    log.info("✓ Workspace selected: {}", sessionId);
+                } catch (Exception e) {
+                    log.warn("Workspace selection failed (may not exist): {}", e.getMessage());
+                }
+
+                // 2. Terraform destroy 실행 (부분 생성된 리소스 제거)
+                try {
+                    context.updateStatus(InfraStatus.DESTROYING, 30, "Auto-rollback: Running terraform destroy...");
+                    runCommand(workDir, "terraform", "destroy", "-auto-approve", "-input=false");
+                    log.info("✓ Resources destroyed");
+                } catch (Exception e) {
+                    log.error("❌ Terraform destroy failed during rollback: {}", e.getMessage());
+                    context.updateStatus(InfraStatus.FAILED, 0,
+                        "Auto-rollback failed: " + e.getMessage() + " (Manual cleanup may be required)");
+                    return;
+                }
+
+                // 3. Workspace 정리
+                try {
+                    context.updateStatus(InfraStatus.DESTROYING, 80, "Auto-rollback: Cleaning up workspace...");
+                    runCommand(workDir, "terraform", "workspace", "select", "default");
+                    runCommand(workDir, "terraform", "workspace", "delete", sessionId);
+                    log.info("✓ Workspace deleted: {}", sessionId);
+                } catch (Exception e) {
+                    log.warn("Workspace cleanup failed: {}", e.getMessage());
+                }
+
+                // 4. 로컬 파일 삭제
+                deleteDirectory(new File(workDir));
+
+                // 5. 세션 제거
+                sessions.remove(sessionId);
+
+                context.updateStatus(InfraStatus.FAILED, 100,
+                    "Provisioning failed. All resources have been rolled back successfully.");
+                log.info("✅ Auto-rollback completed for session: {}", sessionId);
+
+            } catch (Exception e) {
+                log.error("❌ Critical error during auto-rollback for session: {}",
+                    context.getSessionId(), e);
+                context.updateStatus(InfraStatus.FAILED, 0,
+                    "Auto-rollback critical error: " + e.getMessage() + " (URGENT: Manual cleanup required!)");
+            }
+        });
+    }
+
+    /**
      * Terraform destroy 실행
      */
     private String executeTerraformDestroy(SessionContext context) throws Exception {
@@ -251,9 +455,22 @@ public class TerraformService {
             log.warn("Failed to select workspace {}, it may not exist", sessionId);
         }
 
-        // 2. Terraform destroy 실행
+        // 2. Terraform destroy 실행 (State Lock 에러 시 자동 재시도)
         context.updateStatus(InfraStatus.DESTROYING, 30, "Running terraform destroy...");
-        runCommand(workDir, "terraform", "destroy", "-auto-approve", "-input=false");
+        try {
+            runCommand(workDir, "terraform", "destroy", "-auto-approve", "-input=false");
+        } catch (RuntimeException e) {
+            // ⭐ State Lock 에러 감지
+            if (e.getMessage() != null && e.getMessage().contains("Error acquiring the state lock")) {
+                log.warn("🔒 State lock detected. Attempting to force unlock...");
+                handleStateLockError(context, workDir, e);
+                // 재시도
+                context.updateStatus(InfraStatus.DESTROYING, 40, "Retrying terraform destroy...");
+                runCommand(workDir, "terraform", "destroy", "-auto-approve", "-input=false");
+            } else {
+                throw e; // Lock 에러가 아니면 그대로 재발생
+            }
+        }
 
         // 3. Workspace 삭제 (선택사항)
         context.updateStatus(InfraStatus.DESTROYING, 80, "Cleaning up workspace...");
@@ -444,6 +661,77 @@ public class TerraformService {
     }
 
     /**
+     * ⭐ 명령어 실행 (로그 출력 없음 - graph 생성용)
+     */
+    private String runCommandSilent(String workDir, String... command) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.directory(new File(workDir));
+        pb.redirectErrorStream(true);
+
+        Process process = pb.start();
+
+        StringBuilder output = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+        }
+
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("Command failed with exit code " + exitCode + ": " + output);
+        }
+
+        return output.toString();
+    }
+
+    /**
+     * ⭐ State Lock 에러 공통 처리
+     */
+    private void handleStateLockError(SessionContext context, String workDir, RuntimeException e) {
+        String lockId = extractLockId(e.getMessage());
+        if (lockId != null) {
+            try {
+                log.info("Forcing unlock with Lock ID: {}", lockId);
+                context.updateStatus(context.getStatus(),
+                    context.getProgressPercentage(),
+                    "Detected state lock. Forcing unlock...");
+
+                runCommand(workDir, "terraform", "force-unlock", "-force", lockId);
+                log.info("✅ Lock released successfully");
+
+                context.updateStatus(context.getStatus(),
+                    context.getProgressPercentage(),
+                    "Lock released. Retrying...");
+            } catch (Exception unlockError) {
+                log.error("Failed to force unlock: {}", unlockError.getMessage());
+                throw e; // 원래 에러 재발생
+            }
+        } else {
+            log.error("Could not extract Lock ID from error message");
+            throw e;
+        }
+    }
+
+    /**
+     * ⭐ Terraform 에러 메시지에서 Lock ID 추출
+     */
+    private String extractLockId(String errorMessage) {
+        try {
+            // "ID:        198e8aeb-21d9-5621-bc64-e70cecc4dffb" 패턴 찾기
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("ID:\\s+([a-f0-9-]+)");
+            java.util.regex.Matcher matcher = pattern.matcher(errorMessage);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+        } catch (Exception e) {
+            log.error("Failed to extract Lock ID", e);
+        }
+        return null;
+    }
+
+    /**
      * 디렉토리 삭제
      */
     private void deleteDirectory(File directory) {
@@ -475,6 +763,13 @@ public class TerraformService {
                         ctx.getLastUpdated()
                 ))
                 .toList();
+    }
+
+    /**
+     * ⭐ 세션 컨텍스트 조회 (프론트엔드 API용)
+     */
+    public SessionContext getSessionContext(String sessionId) {
+        return sessions.get(sessionId);
     }
 
     /**

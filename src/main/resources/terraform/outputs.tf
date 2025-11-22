@@ -20,6 +20,17 @@ output "private_subnet_id" {
   value       = aws_subnet.private.id
 }
 
+# NAT Gateway Outputs
+output "nat_gateway_id" {
+  description = "NAT Gateway ID"
+  value       = aws_nat_gateway.main.id
+}
+
+output "nat_gateway_public_ip" {
+  description = "NAT Gateway의 퍼블릭 IP"
+  value       = aws_eip.nat.public_ip
+}
+
 # EC2 Outputs
 output "ec2_instance_id" {
   description = "EC2 인스턴스 ID"
@@ -140,12 +151,13 @@ output "cloudwatch_dashboard_url" {
 output "deployment_summary" {
   description = "배포 요약 정보"
   value = {
-    session_id              = var.session_id
-    region                  = var.aws_region
-    ec2_public_ip           = aws_eip.app_server.public_ip
-    application_url         = "http://${aws_eip.app_server.public_ip}:8080"
-    vpc_id                  = aws_vpc.main.id
-    resources_created       = "VPC, EC2, S3(2), DynamoDB(3), Lambda, SNS, CloudWatch"
-    dashboard_url           = "https://console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${aws_cloudwatch_dashboard.main.dashboard_name}"
+    session_id            = var.session_id
+    region                = var.aws_region
+    ec2_public_ip         = aws_eip.app_server.public_ip
+    nat_gateway_public_ip = aws_eip.nat.public_ip
+    application_url       = "http://${aws_eip.app_server.public_ip}:8080"
+    vpc_id                = aws_vpc.main.id
+    resources_created     = "VPC(+NAT Gateway), EC2, S3(2), DynamoDB(3), Lambda, SNS, CloudWatch"
+    dashboard_url         = "https://console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${aws_cloudwatch_dashboard.main.dashboard_name}"
   }
 }

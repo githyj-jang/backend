@@ -23,10 +23,10 @@
 
 # DynamoDB Table for Application Data
 resource "aws_dynamodb_table" "app_data" {
-  name           = "${var.project_name}-${var.session_id}-data"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "id"
-  range_key      = "timestamp"
+  name         = "${var.project_name}-${var.session_id}-data"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+  range_key    = "timestamp"
 
   attribute {
     name = "id"
@@ -67,10 +67,10 @@ resource "aws_dynamodb_table" "app_data" {
 
 # DynamoDB Table for Monitoring Metrics
 resource "aws_dynamodb_table" "metrics" {
-  name           = "${var.project_name}-${var.session_id}-metrics"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "metric_name"
-  range_key      = "timestamp"
+  name         = "${var.project_name}-${var.session_id}-metrics"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "metric_name"
+  range_key    = "timestamp"
 
   attribute {
     name = "metric_name"

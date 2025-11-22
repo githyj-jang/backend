@@ -18,10 +18,10 @@ resource "aws_lambda_function" "alarm_processor" {
 
   environment {
     variables = {
-      SESSION_ID            = var.session_id
-      METRICS_TABLE_NAME    = aws_dynamodb_table.metrics.name
-      CLOUDWATCH_NAMESPACE  = "PenguinLand/${var.session_id}"
-      PROJECT_NAME          = var.project_name
+      SESSION_ID           = var.session_id
+      METRICS_TABLE_NAME   = aws_dynamodb_table.metrics.name
+      CLOUDWATCH_NAMESPACE = "PenguinLand/${var.session_id}"
+      PROJECT_NAME         = var.project_name
     }
   }
 

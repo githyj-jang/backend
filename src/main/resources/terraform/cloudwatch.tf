@@ -212,16 +212,110 @@ resource "aws_cloudwatch_metric_alarm" "lambda_throttles" {
   }
 }
 
+# ===== 5xx Error Rate Alarms (커스텀 메트릭) =====
+# Spring Boot에서 다음 메트릭을 전송해야 합니다:
+# - Namespace: PenguinLand/${session_id}
+# - Metric: ErrorRate5xx (단위: Percent)
+
+resource "aws_cloudwatch_metric_alarm" "error_rate_warning" {
+  alarm_name          = "${var.project_name}-${var.session_id}-error-rate-warning"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ErrorRate5xx"
+  namespace           = "PenguinLand/${var.session_id}"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.error_rate_warning_threshold
+  alarm_description   = "5xx 에러율이 ${var.error_rate_warning_threshold}%를 초과했습니다"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.project_name}-${var.session_id}-error-rate-warning"
+    Severity = "warning"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "error_rate_critical" {
+  alarm_name          = "${var.project_name}-${var.session_id}-error-rate-critical"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ErrorRate5xx"
+  namespace           = "PenguinLand/${var.session_id}"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.error_rate_critical_threshold
+  alarm_description   = "5xx 에러율이 ${var.error_rate_critical_threshold}%를 초과했습니다 (위험)"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.project_name}-${var.session_id}-error-rate-critical"
+    Severity = "critical"
+  }
+}
+
+# ===== Latency Alarms (커스텀 메트릭) =====
+# Spring Boot에서 다음 메트릭을 전송해야 합니다:
+# - Namespace: PenguinLand/${session_id}
+# - Metric: ResponseTimeMs (단위: Milliseconds)
+
+resource "aws_cloudwatch_metric_alarm" "latency_warning" {
+  alarm_name          = "${var.project_name}-${var.session_id}-latency-warning"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ResponseTimeMs"
+  namespace           = "PenguinLand/${var.session_id}"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.latency_warning_threshold
+  alarm_description   = "응답 시간이 ${var.latency_warning_threshold}ms를 초과했습니다"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.project_name}-${var.session_id}-latency-warning"
+    Severity = "warning"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "latency_critical" {
+  alarm_name          = "${var.project_name}-${var.session_id}-latency-critical"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ResponseTimeMs"
+  namespace           = "PenguinLand/${var.session_id}"
+  period              = 300
+  statistic           = "Average"
+  threshold           = var.latency_critical_threshold
+  alarm_description   = "응답 시간이 ${var.latency_critical_threshold}ms를 초과했습니다 (위험)"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.project_name}-${var.session_id}-latency-critical"
+    Severity = "critical"
+  }
+}
+
 # ===== Composite Alarm (종합 알람) =====
 
 resource "aws_cloudwatch_composite_alarm" "system_health" {
-  alarm_name          = "${var.project_name}-${var.session_id}-system-health"
-  alarm_description   = "시스템 전체 상태를 나타내는 종합 알람"
-  actions_enabled     = true
-  alarm_actions       = [aws_sns_topic.alarms.arn]
-  ok_actions          = [aws_sns_topic.alarms.arn]
+  alarm_name        = "${var.project_name}-${var.session_id}-system-health"
+  alarm_description = "시스템 전체 상태를 나타내는 종합 알람"
+  actions_enabled   = true
+  alarm_actions     = [aws_sns_topic.alarms.arn]
+  ok_actions        = [aws_sns_topic.alarms.arn]
 
-  alarm_rule = "ALARM(${aws_cloudwatch_metric_alarm.cpu_critical.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.instance_status_check.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.system_status_check.alarm_name})"
+  alarm_rule = "ALARM(${aws_cloudwatch_metric_alarm.cpu_critical.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.error_rate_critical.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.latency_critical.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.instance_status_check.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.system_status_check.alarm_name})"
 
   tags = {
     Name     = "${var.project_name}-${var.session_id}-system-health"
@@ -297,6 +391,67 @@ resource "aws_cloudwatch_dashboard" "main" {
           period = 300
           region = var.aws_region
           title  = "Lambda 함수 메트릭"
+        }
+      },
+      {
+        type = "metric"
+        properties = {
+          metrics = [
+            ["PenguinLand/${var.session_id}", "ErrorRate5xx", { stat = "Average", label = "5xx 에러율" }]
+          ]
+          period = 300
+          region = var.aws_region
+          title  = "5xx 에러율 (%)"
+          annotations = {
+            horizontal = [
+              {
+                label = "경고 (${var.error_rate_warning_threshold}%)"
+                value = var.error_rate_warning_threshold
+                color = "#ff9900"
+              },
+              {
+                label = "위험 (${var.error_rate_critical_threshold}%)"
+                value = var.error_rate_critical_threshold
+                color = "#d13212"
+              }
+            ]
+          }
+          yAxis = {
+            left = {
+              min = 0
+            }
+          }
+        }
+      },
+      {
+        type = "metric"
+        properties = {
+          metrics = [
+            ["PenguinLand/${var.session_id}", "ResponseTimeMs", { stat = "Average", label = "평균 응답 시간" }],
+            ["...", { stat = "Maximum", label = "최대 응답 시간" }]
+          ]
+          period = 300
+          region = var.aws_region
+          title  = "응답 시간 (ms)"
+          annotations = {
+            horizontal = [
+              {
+                label = "경고 (${var.latency_warning_threshold}ms)"
+                value = var.latency_warning_threshold
+                color = "#ff9900"
+              },
+              {
+                label = "위험 (${var.latency_critical_threshold}ms)"
+                value = var.latency_critical_threshold
+                color = "#d13212"
+              }
+            ]
+          }
+          yAxis = {
+            left = {
+              min = 0
+            }
+          }
         }
       }
     ]
