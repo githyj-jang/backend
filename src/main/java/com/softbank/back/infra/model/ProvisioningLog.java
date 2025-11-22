@@ -1,9 +1,19 @@
 package com.softbank.back.infra.model;
 
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
 import java.time.LocalDateTime;
 
-// Lombok을 사용하지 않는 경우 생성자, Getter/Setter 필요
+/**
+ * FR-02: Terraform 배포 상태 및 로그 정보
+ */
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
 public class ProvisioningLog {
+    private String sessionId;
     private InfraStatus status;
     private int progressPercentage;
     private String latestLog;
@@ -15,7 +25,4 @@ public class ProvisioningLog {
         this.latestLog = latestLog;
         this.updateTime = updateTime;
     }
-
-    // Getter 및 Setter는 생략합니다. (실제 프로젝트에서는 Lombok 권장)
-    // Getter 예: public InfraStatus getStatus() { return status; }
 }
