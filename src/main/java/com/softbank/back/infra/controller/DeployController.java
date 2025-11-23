@@ -130,7 +130,7 @@ public class DeployController {
             // ⭐ Terraform graph 생성
             String graph = null;
             try {
-                graph = terraformService.getTerraformGraph(sessionId);
+//                graph = terraformService.getTerraformGraph(sessionId);
             } catch (Exception e) {
                 log.warn("Failed to generate terraform graph for session: {}", sessionId, e);
                 // graph 생성 실패해도 리소스 정보는 반환
