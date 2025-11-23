@@ -44,7 +44,8 @@ public class MonitoringSimpleController {
                 STATE.healthScore,
                 STATE.healthState,
                 STATE.penguinAnimation,
-                STATE.coachMessage
+                STATE.coachMessage,
+                STATE.causes
         );
 
         // alerts는 최근 알림 5개까지
@@ -74,6 +75,7 @@ public class MonitoringSimpleController {
         volatile int lastScenarioIndex = -1; // 0~4
 
         final Deque<Alert> alerts = new ArrayDeque<>();
+        volatile List<HealthCause> causes = new ArrayList<>();
 
         synchronized void maybeUpdate() {
             int scenarioIdx = currentScenarioIndex(); // 0..4
@@ -97,6 +99,13 @@ public class MonitoringSimpleController {
                              + sevLatency * 0.35 * 100
                              + sevCpu * 0.15 * 100;
                 this.healthScore = (int) clamp(Math.round(score), 0, 100);
+
+                // 상태 원인 계산
+                List<HealthCause> newCauses = new ArrayList<>();
+                newCauses.add(new HealthCause("CPU", getSeverityLevel(sevCpu), round1(sevCpu * 0.15 * 100)));
+                newCauses.add(new HealthCause("Latency", getSeverityLevel(sevLatency), round1(sevLatency * 0.35 * 100)));
+                newCauses.add(new HealthCause("ErrorRate", getSeverityLevel(sevError), round1(sevError * 0.50 * 100)));
+                this.causes = newCauses;
 
                 // 상태 분류 (HealthScoreEngine 규칙과 동일)
                 String state;
@@ -192,6 +201,12 @@ public class MonitoringSimpleController {
             return Math.max(lo, Math.min(hi, v));
         }
 
+        private String getSeverityLevel(double severity) {
+            if (severity <= 0.3) return "normal";
+            else if (severity <= 0.7) return "warning";
+            else return "danger";
+        }
+
         private record Scenario(
                 double cpu, double latency, double errorRate,
                 Double errorBandLower, Double errorBandUpper,
@@ -232,12 +247,14 @@ public class MonitoringSimpleController {
         public String healthState;       // 'healthy' | 'warning' | 'danger'
         public String penguinAnimation;  // 'happy' | 'worried' | 'crying'
         public String coachMessage;
+        public List<HealthCause> causes; // 상태 원인 분석
 
-        public AnomalyScore(int healthScore, String healthState, String penguinAnimation, String coachMessage) {
+        public AnomalyScore(int healthScore, String healthState, String penguinAnimation, String coachMessage, List<HealthCause> causes) {
             this.healthScore = healthScore;
             this.healthState = healthState;
             this.penguinAnimation = penguinAnimation;
             this.coachMessage = coachMessage;
+            this.causes = causes;
         }
     }
 
@@ -254,6 +271,18 @@ public class MonitoringSimpleController {
             this.message = message;
             this.timestamp = timestamp;
             this.acknowledged = acknowledged;
+        }
+    }
+
+    public static class HealthCause {
+        public String metric;           // 지표 이름: 'CPU' | 'Latency' | 'ErrorRate'
+        public String severity;         // 심각도: 'normal' | 'warning' | 'danger'
+        public double contribution;     // healthScore에 대한 기여도 (0-100)
+
+        public HealthCause(String metric, String severity, double contribution) {
+            this.metric = metric;
+            this.severity = severity;
+            this.contribution = contribution;
         }
     }
 
