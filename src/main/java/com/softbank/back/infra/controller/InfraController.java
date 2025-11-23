@@ -51,7 +51,7 @@ public class InfraController {
 
         try {
             // 비동기 프로비저닝 시작
-            CompletableFuture<InfraResponse> future = terraformService.applyInfrastructure(request);
+            terraformService.applyInfrastructure(request);
 
             return ResponseEntity.accepted().body(Map.of(
                     "sessionId", request.getSessionId(),
@@ -177,6 +177,23 @@ public class InfraController {
                 "status", "UP",
                 "service", "Infrastructure Management Service"
         ));
+    }
+
+    /**
+     * ⭐ 서버 리소스 상태 조회 (동시 실행 제한 정보)
+     * EC2 환경에서 서버 부하를 모니터링하는 데 사용됩니다.
+     */
+    @GetMapping("/server/resources")
+    public ResponseEntity<Map<String, Object>> getServerResourceStatus() {
+        log.debug(">> [InfraController] Getting server resource status");
+
+        try {
+            Map<String, Object> status = terraformService.getServerResourceStatus();
+            return ResponseEntity.ok(status);
+        } catch (Exception e) {
+            log.error("Failed to get server resource status", e);
+            return ResponseEntity.internalServerError().build();
+        }
     }
 
     /**

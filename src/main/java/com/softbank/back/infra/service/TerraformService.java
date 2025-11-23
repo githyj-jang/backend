@@ -10,8 +10,7 @@ import java.io.*;
 import java.nio.file.*;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 
 @Slf4j
 @Service
@@ -23,13 +22,77 @@ public class TerraformService {
     @Value("${terraform.workspace.path:./terraform-workspaces}")
     private String workspacePath;
 
+    @Value("${terraform.max.concurrent.operations:1}")
+    private int maxConcurrentOperations;
+
+    @Value("${terraform.max.queue.size:10}")
+    private int maxQueueSize;
+
     // 세션별 실행 컨텍스트 관리
     private final Map<String, SessionContext> sessions = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final TerraformBackendService backendService;
 
+    // 동시 실행 제한을 위한 Semaphore
+    private Semaphore executionSemaphore;
+
+    // 전용 스레드 풀 (제한된 크기)
+    private ExecutorService terraformExecutor;
+
+    // 대기 중인 작업 추적
+    private final Map<String, CompletableFuture<?>> pendingTasks = new ConcurrentHashMap<>();
+
     public TerraformService(TerraformBackendService backendService) {
         this.backendService = backendService;
+    }
+
+    @jakarta.annotation.PostConstruct
+    public void initializeExecutor() {
+        // 동시 실행 제한 Semaphore 초기화
+        this.executionSemaphore = new Semaphore(maxConcurrentOperations, true); // fair mode
+
+        // 전용 스레드 풀 생성 (최대 큐 크기 제한)
+        BlockingQueue<Runnable> workQueue = new LinkedBlockingQueue<>(maxQueueSize);
+        this.terraformExecutor = new ThreadPoolExecutor(
+            1, // core pool size
+            maxConcurrentOperations, // maximum pool size
+            60L, TimeUnit.SECONDS, // keep alive time
+            workQueue,
+            new ThreadFactory() {
+                private final java.util.concurrent.atomic.AtomicInteger counter = new java.util.concurrent.atomic.AtomicInteger(0);
+                @Override
+                @SuppressWarnings("NullableProblems")
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r);
+                    t.setName("terraform-executor-" + counter.incrementAndGet());
+                    t.setDaemon(false);
+                    return t;
+                }
+            },
+            new ThreadPoolExecutor.AbortPolicy() // 큐가 가득 차면 예외 발생
+        );
+
+        log.info("🚀 Terraform Executor initialized: maxConcurrent={}, maxQueueSize={}",
+            maxConcurrentOperations, maxQueueSize);
+
+        // 세션 복구는 별도로 실행
+        recoverSessions();
+    }
+
+    @jakarta.annotation.PreDestroy
+    public void shutdownExecutor() {
+        log.info("🛑 Shutting down Terraform Executor...");
+        if (terraformExecutor != null) {
+            terraformExecutor.shutdown();
+            try {
+                if (!terraformExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    terraformExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                terraformExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**
@@ -94,6 +157,7 @@ public class TerraformService {
     /**
      * FR-01: 비동기 인프라 배포 시작 (타임아웃 및 자동 롤백 포함)
      * PUT 메서드로 호출 - 기존 인프라가 있으면 업데이트, 없으면 생성
+     * ⭐ Semaphore를 사용한 동시 실행 제한 추가
      */
     public CompletableFuture<InfraResponse> applyInfrastructure(TerraformRequest request) {
         String sessionId = request.getSessionId();
@@ -111,42 +175,87 @@ public class TerraformService {
         }
 
         context.setRequest(request);
-        context.updateStatus(InfraStatus.INIT, 0, "Initializing Terraform...");
 
-        // 비동기 작업 시작 (10분 타임아웃 설정)
+        // 대기열 상태 확인
+        int availablePermits = executionSemaphore.availablePermits();
+        int queuedTasks = pendingTasks.size();
+
+        if (availablePermits == 0) {
+            log.warn("⏳ No available execution slots. Session {} will be queued. Current queue: {}/{}",
+                sessionId, queuedTasks, maxQueueSize);
+            context.updateStatus(InfraStatus.INIT, 0,
+                String.format("Waiting in queue... (%d/%d tasks ahead)", queuedTasks, maxConcurrentOperations));
+        } else {
+            context.updateStatus(InfraStatus.INIT, 0, "Initializing Terraform...");
+        }
+
+        // 비동기 작업 시작 (전용 스레드 풀 사용)
         CompletableFuture<InfraResponse> task = CompletableFuture.supplyAsync(() -> {
+            // Semaphore 획득 시도
+            boolean acquired = false;
             try {
+                log.info("🔒 Session {} waiting for execution permit...", sessionId);
+                context.updateStatus(InfraStatus.INIT, 0, "Waiting for available resources...");
+
+                // 최대 30초 대기 (대기 시간 초과 시 예외)
+                acquired = executionSemaphore.tryAcquire(30, TimeUnit.SECONDS);
+
+                if (!acquired) {
+                    log.error("❌ Session {} failed to acquire execution permit within 30 seconds", sessionId);
+                    throw new RuntimeException("Server is too busy. Please try again later.");
+                }
+
+                log.info("✅ Session {} acquired execution permit. Starting terraform apply...", sessionId);
+                context.updateStatus(InfraStatus.INIT, 0, "Starting Terraform execution...");
+
                 return executeTerrformApply(context);
+            } catch (InterruptedException e) {
+                log.error("❌ Session {} interrupted while waiting for permit", sessionId, e);
+                Thread.currentThread().interrupt();
+                context.updateStatus(InfraStatus.FAILED, 0, "Interrupted while waiting");
+                throw new RuntimeException("Execution interrupted", e);
             } catch (Exception e) {
                 log.error("Terraform apply failed for session {}", sessionId, e);
                 context.updateStatus(InfraStatus.FAILED, 0, "Error: " + e.getMessage());
                 throw new RuntimeException("Terraform apply failed", e);
+            } finally {
+                // Semaphore 반환
+                if (acquired) {
+                    executionSemaphore.release();
+                    log.info("🔓 Session {} released execution permit. Available: {}/{}",
+                        sessionId, executionSemaphore.availablePermits(), maxConcurrentOperations);
+                }
+                // 대기 목록에서 제거
+                pendingTasks.remove(sessionId);
             }
-        }).orTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
-          .exceptionally(ex -> {
-              // 타임아웃 또는 에러 발생 시 자동 롤백
-              if (ex.getCause() instanceof java.util.concurrent.TimeoutException) {
-                  log.error("⏱️ Terraform apply timeout (10 minutes) for session: {}", sessionId);
-                  context.updateStatus(InfraStatus.FAILED, 0, "Timeout: Terraform apply exceeded 10 minutes");
+        }, terraformExecutor) // 전용 스레드 풀 사용
+        .orTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
+        .exceptionally(ex -> {
+            // 타임아웃 또는 에러 발생 시 자동 롤백
+            if (ex.getCause() instanceof java.util.concurrent.TimeoutException) {
+                log.error("⏱️ Terraform apply timeout (10 minutes) for session: {}", sessionId);
+                context.updateStatus(InfraStatus.FAILED, 0, "Timeout: Terraform apply exceeded 10 minutes");
+                executeAutoRollback(context);
+            } else if (ex.getCause() instanceof RejectedExecutionException) {
+                log.error("❌ Task queue is full for session: {}", sessionId);
+                context.updateStatus(InfraStatus.FAILED, 0, "Server queue is full. Please try again later.");
+            } else {
+                log.error("❌ Terraform apply error for session: {}", sessionId, ex);
+                executeAutoRollback(context);
+            }
 
-                  // 자동 롤백 실행
-                  executeAutoRollback(context);
-              } else {
-                  log.error("❌ Terraform apply error for session: {}", sessionId, ex);
+            throw new RuntimeException("Provisioning failed and rolled back", ex);
+        });
 
-                  // 부분 생성 실패 시 자동 롤백
-                  executeAutoRollback(context);
-              }
-
-              throw new RuntimeException("Provisioning failed and rolled back", ex);
-          });
-
+        // 대기 목록에 추가
+        pendingTasks.put(sessionId, task);
         context.setCurrentTask(task.thenAccept(r -> {}));
         return task;
     }
 
     /**
      * FR-04: 리소스 파괴 (개선: 세션이 없어도 작동)
+     * ⭐ Semaphore를 사용한 동시 실행 제한 추가
      */
     public CompletableFuture<String> destroyInfrastructure(String sessionId) {
         SessionContext context = sessions.get(sessionId);
@@ -178,21 +287,71 @@ public class TerraformService {
             throw new IllegalStateException("Another operation is in progress for session: " + sessionId);
         }
 
-        context.updateStatus(InfraStatus.DESTROYING, 0, "Starting terraform destroy...");
+        // 대기열 상태 확인
+        int availablePermits = executionSemaphore.availablePermits();
+        int queuedTasks = pendingTasks.size();
+
+        if (availablePermits == 0) {
+            log.warn("⏳ No available execution slots. Session {} destroy will be queued. Current queue: {}/{}",
+                sessionId, queuedTasks, maxQueueSize);
+            context.updateStatus(InfraStatus.DESTROYING, 0,
+                String.format("Waiting in queue... (%d/%d tasks ahead)", queuedTasks, maxConcurrentOperations));
+        } else {
+            context.updateStatus(InfraStatus.DESTROYING, 0, "Starting terraform destroy...");
+        }
 
         final SessionContext finalContext = context;
 
         CompletableFuture<String> task = CompletableFuture.supplyAsync(() -> {
+            // Semaphore 획득 시도
+            boolean acquired = false;
             try {
+                log.info("🔒 Session {} waiting for execution permit (destroy)...", sessionId);
+                finalContext.updateStatus(InfraStatus.DESTROYING, 0, "Waiting for available resources...");
+
+                // 최대 30초 대기
+                acquired = executionSemaphore.tryAcquire(30, TimeUnit.SECONDS);
+
+                if (!acquired) {
+                    log.error("❌ Session {} failed to acquire execution permit within 30 seconds", sessionId);
+                    throw new RuntimeException("Server is too busy. Please try again later.");
+                }
+
+                log.info("✅ Session {} acquired execution permit. Starting terraform destroy...", sessionId);
+                finalContext.updateStatus(InfraStatus.DESTROYING, 0, "Destroying infrastructure...");
+
                 return executeTerraformDestroy(finalContext);
+            } catch (InterruptedException e) {
+                log.error("❌ Session {} interrupted while waiting for permit", sessionId, e);
+                Thread.currentThread().interrupt();
+                finalContext.updateStatus(InfraStatus.FAILED, 0, "Interrupted while waiting");
+                throw new RuntimeException("Execution interrupted", e);
             } catch (Exception e) {
                 log.error("Terraform destroy failed for session {}", sessionId, e);
                 finalContext.updateStatus(InfraStatus.FAILED, 0, "Destroy failed: " + e.getMessage());
                 throw new RuntimeException("Terraform destroy failed", e);
+            } finally {
+                // Semaphore 반환
+                if (acquired) {
+                    executionSemaphore.release();
+                    log.info("🔓 Session {} released execution permit. Available: {}/{}",
+                        sessionId, executionSemaphore.availablePermits(), maxConcurrentOperations);
+                }
+                // 대기 목록에서 제거
+                pendingTasks.remove(sessionId);
             }
+        }, terraformExecutor) // 전용 스레드 풀 사용
+        .exceptionally(ex -> {
+            if (ex.getCause() instanceof RejectedExecutionException) {
+                log.error("❌ Task queue is full for session: {}", sessionId);
+                finalContext.updateStatus(InfraStatus.FAILED, 0, "Server queue is full. Please try again later.");
+            }
+            throw new RuntimeException("Destroy failed", ex);
         });
 
-        context.setCurrentTask(task.thenAccept(r -> {}));
+        // 대기 목록에 추가
+        pendingTasks.put(sessionId, task);
+        finalContext.setCurrentTask(task.thenAccept(r -> {}));
         return task;
     }
 
@@ -212,6 +371,49 @@ public class TerraformService {
                 context.getLatestLog(),
                 context.getLastUpdated()
         );
+    }
+
+    /**
+     * 서버 리소스 상태 조회 (동시 실행 제한 정보)
+     */
+    public Map<String, Object> getServerResourceStatus() {
+        Map<String, Object> status = new HashMap<>();
+
+        // 실행 슬롯 정보
+        int availableSlots = executionSemaphore.availablePermits();
+        int totalSlots = maxConcurrentOperations;
+        int activeSlots = totalSlots - availableSlots;
+
+        status.put("totalExecutionSlots", totalSlots);
+        status.put("availableSlots", availableSlots);
+        status.put("activeSlots", activeSlots);
+        status.put("queuedTasks", pendingTasks.size());
+        status.put("maxQueueSize", maxQueueSize);
+
+        // 스레드 풀 정보
+        if (terraformExecutor instanceof ThreadPoolExecutor) {
+            ThreadPoolExecutor executor = (ThreadPoolExecutor) terraformExecutor;
+            status.put("poolSize", executor.getPoolSize());
+            status.put("activeThreads", executor.getActiveCount());
+            status.put("completedTasks", executor.getCompletedTaskCount());
+            status.put("queueSize", executor.getQueue().size());
+        }
+
+        // 활성 세션 정보
+        List<Map<String, Object>> activeSessions = new ArrayList<>();
+        for (Map.Entry<String, SessionContext> entry : sessions.entrySet()) {
+            SessionContext ctx = entry.getValue();
+            if (ctx.getCurrentTask() != null && !ctx.getCurrentTask().isDone()) {
+                Map<String, Object> sessionInfo = new HashMap<>();
+                sessionInfo.put("sessionId", entry.getKey());
+                sessionInfo.put("status", ctx.getStatus());
+                sessionInfo.put("progress", ctx.getProgressPercentage());
+                activeSessions.add(sessionInfo);
+            }
+        }
+        status.put("activeSessions", activeSessions);
+
+        return status;
     }
 
     /**
