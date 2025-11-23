@@ -44,8 +44,8 @@ public class DeployController {
             // 기본 설정으로 TerraformRequest 생성
             TerraformRequest terraformRequest = createDefaultTerraformRequest(sessionId);
 
-            // 기존 TerraformService 활용
-            CompletableFuture<InfraResponse> future = terraformService.applyInfrastructure(terraformRequest);
+            // 기존 TerraformService 활용 (비동기)
+            terraformService.applyInfrastructure(terraformRequest);
 
             return ResponseEntity.accepted().body(Map.of("sessionId", sessionId));
 
@@ -130,7 +130,7 @@ public class DeployController {
             // ⭐ Terraform graph 생성
             String graph = null;
             try {
-                graph = terraformService.getTerraformGraph(sessionId);
+//                graph = terraformService.getTerraformGraph(sessionId);
             } catch (Exception e) {
                 log.warn("Failed to generate terraform graph for session: {}", sessionId, e);
                 // graph 생성 실패해도 리소스 정보는 반환
@@ -154,23 +154,54 @@ public class DeployController {
 
     /**
      * DELETE /api/v1/deploy/:sessionId
-     * 리소스 전체 삭제
+     * 리소스 전체 삭제 (동기 방식 - 삭제 완료까지 대기)
+     * 타임아웃: 10분
      */
     @DeleteMapping("/{sessionId}")
     public ResponseEntity<Map<String, Object>> deleteResources(@PathVariable String sessionId) {
-        log.info(">> [DeployController] Deleting resources for session: {}", sessionId);
+        log.info(">> [DeployController] Deleting resources for session: {} (synchronous mode, 10min timeout)", sessionId);
 
         try {
-            terraformService.destroyInfrastructure(sessionId);
+            // 비동기 작업 시작
+            CompletableFuture<String> future = terraformService.destroyInfrastructure(sessionId);
 
-            // 빈 객체 반환 (프론트엔드 요청사항)
-            return ResponseEntity.accepted().body(Collections.emptyMap());
+            // ⭐ 작업이 완료될 때까지 대기 (동기 방식, 최대 10분)
+            future.get(10, java.util.concurrent.TimeUnit.MINUTES); // 10분 타임아웃
+
+            log.info("✅ Delete completed successfully for session: {}", sessionId);
+
+            // 삭제 성공 응답 (빈 객체 반환 - 프론트엔드 요청사항)
+            return ResponseEntity.ok().body(Map.of(
+                    "message", "Resources deleted successfully",
+                    "sessionId", sessionId
+            ));
 
         } catch (IllegalStateException e) {
             log.error("Delete failed for session: {}", sessionId, e);
             return ResponseEntity.status(409).body(Map.of(
                     "error", "CONFLICT",
                     "message", e.getMessage()
+            ));
+        } catch (java.util.concurrent.ExecutionException e) {
+            // CompletableFuture 실행 중 에러 발생
+            Throwable cause = e.getCause();
+            log.error("Delete execution failed for session: {}", sessionId, cause);
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "error", "DELETE_FAILED",
+                    "message", cause != null ? cause.getMessage() : e.getMessage()
+            ));
+        } catch (java.util.concurrent.TimeoutException e) {
+            log.error("Delete timeout (10 minutes) for session: {}", sessionId, e);
+            return ResponseEntity.status(504).body(Map.of(
+                    "error", "TIMEOUT",
+                    "message", "Delete operation exceeded 10 minutes. Please check the status manually."
+            ));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Delete interrupted for session: {}", sessionId, e);
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "error", "INTERRUPTED",
+                    "message", "Delete operation was interrupted"
             ));
         } catch (Exception e) {
             log.error("Unexpected error during delete", e);
