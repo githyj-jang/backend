@@ -419,12 +419,12 @@ runCommand("terraform", "force-unlock", "-force", lockId);
 
 ---
 
-## 👥 팀
+## 👥 팀 Penguin
 
 **Softbank Cloud Infrastructure Hackathon 2025**
 
-- 개발 기간: 2025년 11월
-- 해커톤: 클라우드 인프라 개발자 대상
+- 개발 기간: 2025년 11월 14~23일
+- 해커톤: 클라우드 인프라 개발자 대상 대회
 
 ---
 
